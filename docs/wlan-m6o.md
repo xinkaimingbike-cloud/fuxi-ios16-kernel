@@ -1,0 +1,416 @@
+# WLAN M6o: independent downstream sequence experiments
+
+The supplied device result eliminates M6n's rank-1 AOP PDC candidate: AOP
+consumed all 13 `wlan_pdc` messages before rails; steps 1–21 passed; step 22
+still reported PBL ERRCODE `0xef0e0003`, BHI STATUS `0xffffffff`, ERRDBG
+`0xa0000000/0/0x80000`, without an SMMU fault. This is the caller's observed
+result, not a new measurement in this change. The eliminations and raw-code
+interpretation limits in [M6n](wlan-m6n.md) still apply.
+
+M6o implements the remaining software-visible deltas as **default-off**
+experiments in [the XNU driver](../xnu/fuxi-wlan/fuxi_wlan.c), with early host
+hooks in [the shared shim sequence](../shim/fuxi-probe/wlan.c). Patch 0099
+contains identical copies. No device, firmware staging, CI, or kernel build
+was used for this change.
+
+## Selection and stop
+
+`fuxiwlanseq` accepts a comma-separated list of the following tokens, in any
+order. Absent or `off` preserves the existing sequence and performs no extra
+experiment MMIO. A single token boots independently; all eight original tokens can be
+combined. `cyclerails` is an additional hazardous opt-in that implies `cycle`;
+`cycle,cyclerails` is also accepted in either order. List order does not change
+hardware order. Duplicates, empty tokens,
+unknown values and truncated lists are rejected before power writes. Combining
+any experiment with `probe=unmapped` or `pattern` is invalid. `prefix` also
+rejects `bhi=full` and `vec=early`: those require the full image/TX allocation
+that this experiment intentionally defers. Other existing selectors remain
+available; `por` owns RX setup when combined with `vec=rddm`.
+
+Use this fixed control argument set, appending one selector from the table:
+
+```
+fuxiwlan=22 fuxiwlanclk=1 fuxiwlanprobe=civac fuxiwlanpre=off fuxiwlanfw=off fuxiwlanbhi=off fuxiwlanvec=off fuxiwlancnss=off
+```
+
+| Variant | Append to control |
+| --- | --- |
+| Probe off/on via WLAN_EN, six rails retained | `fuxiwlanseq=cycle` |
+| Also drop/reapply six rail votes; **froze the SoC once on device** | `fuxiwlanseq=cyclerails` |
+| Downstream PARF decode | `fuxiwlanseq=parf` |
+| Dynamic width / transaction controls | `fuxiwlanseq=dbi` |
+| DBI equalization and core presets | `fuxiwlanseq=eq` |
+| PARF controller event mask | `fuxiwlanseq=hostirq` |
+| 32-message MSI capability / early MASTER | `fuxiwlanseq=msi` |
+| MHI prepare/RDDM/POR | `fuxiwlanseq=por` |
+| Separate 512-KiB BHI allocation | `fuxiwlanseq=prefix` |
+| All deltas with rails retained | `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix` |
+| Existing behavior | `fuxiwlanseq=off` |
+
+All active variants observe for five seconds, print `FUXI WLAN: M6o result seq
+mask ... EE ... STATUS ... ERRCODE ...`, and deliberately fail/contain at step
+22 (`0x166c`), including unexpected BHI success. They never issue an AMSS TX
+doorbell. Step 21 remains one-shot. The mask bits are cycle=1, parf=2, dbi=4,
+eq=8, hostirq=16, msi=32, por=64, prefix=128, cyclerails=256 (also sets
+cycle=1). Cycle/config/host writes print their name/address/value/mask
+**before the initial read and write**, then their readback. Bounded waits announce the
+address/mask/expected value before the first read, then report success or
+timeout. Cycle dwell periods, resume checks and each rail command also print
+a `FUXI WLAN` line before the action. Rail logs report command completion,
+not analog voltage.
+Use fresh boots for independent comparisons. PDC need not be rerun; its policy
+persists independently as described in M6n.
+
+## Pinned sources
+
+Only register names/offsets/constants and protocol facts were used from these
+public sources. The implementation is independent; no downstream driver code,
+firmware, or downloaded source is included in the repository.
+
+* K: MiCode/Xiaomi_Kernel_OpenSource commit
+  `7fad87dc178d09489b74a714e4a525d56f546855`.
+* C: MiCode/vendor_qcom_opensource_wlan commit
+  `518147fd7e0199758efe9bd96a22c9c2ea30bcd9`.
+* X: MiCode/kernel_devicetree commit
+  `5647c799a064dfec73332a4fe2ef7aa3fb2f4887`.
+* D: LineageOS/android_kernel_xiaomi_sm8550-devicetrees commit
+  `13913424c9d0af031a8b8f9981c003bbb9632f73` (matching public KIWI child;
+  the same qualification as M6n).
+
+## `cycle`: WLAN_EN off/on with all six rails retained
+
+The caller observed `cycle,parf,dbi,eq,hostirq,msi,por,prefix` pass steps 1–16,
+clear MASTER/save config, disable the function, enter D3hot and send
+PME_TURNOFF. L23_READY timed out after 100 ms and the cycle continued, asserted
+PERST and disabled LTSSM (`write 0xd read 0x5`). No further WLAN line appeared;
+other kernel output continued briefly, then the whole SoC froze, USB console
+died, and no panic was reported. This is an observed freeze, **not proof that
+rail disable caused it**: the next action was the local DBI Link Status read,
+followed by WLAN_EN low and rail disable. A DBI access stall is another
+possibility. The APPS DRV being the only voter on a shared rail is a guess.
+
+Plain `cycle` now keeps the six existing votes on throughout the cycle and
+containment: **no RPMh enable=0 or voltage commands**. KIWI power control uses
+WLAN_EN low/high with the same 10-ms low and 10-ms high dwell periods.
+`cyclerails` restores the original six-vote off/on experiment and implies
+`cycle`. It **froze the SoC once on device**; do not treat it as the default
+comparison.
+
+The revised plain `cycle` (rails retained, a line before each action) then
+reproduced the freeze on device with the rails untouched. The last line was
+`begin wait 0x60000080 mask 0x20000000 expected 0 limit 100 ms`, printed
+right after PERST low and LTSSM off. So the freeze is the **DBI Link Status
+read itself**, not rail disable. In that state PARF stays readable: PM_STTS
+`+0x24` and LTSSM `+0x1b0` were read without trouble just before.
+
+The first freeze fix made no PCIe0 access (`0x60000000`-`0x63ffffff`: DBI/ELBI,
+config, BAR windows) from link down until PARF reports L0 again. M6q below adds a narrowly bounded
+pre-training DBI exception after controller/PHY reset. Link down is
+a 1 ms dwell followed by a PARF LTSSM read; downstream polls nothing there
+either. Link up waits up to 1 s for PARF LTSSM `[5:0]`=`0x11` (L0, observed
+`0x111` after initial training on device), then checks DBI DLLLA. The ELBI
+PME_TURNOFF clear write is gone, since that bit self-clears (read back 0 on
+device). `fw_access` and `wl_contain_wr` enforce the rule, so an abort or undo
+while the link is down logs `PA ... refused while the PCIe link is down`
+instead of touching it. The host model asserts the same rule: no PCIe0
+access after a trained link has PERST low and LTSSM off.
+
+The chronology comes from [C probe/off](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L5952),
+[C suspend/resume](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1177),
+[C actual power-up](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L2600),
+[K PME_TURNOFF/L23 suspend](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L7927), and
+[D KIWI supplies/pins](https://github.com/LineageOS/android_kernel_xiaomi_sm8550-devicetrees/blob/13913424c9d0af031a8b8f9981c003bbb9632f73/qcom/wlan/kalama-cnss.dtsi#L164).
+
+After initial enumeration/BAR setup and validation of BHI offsets, step 17:
+
+1. Disable message IRQs using the existing helper; clear endpoint COMMAND
+   MASTER (bit 2), then save config. The pinned suspend clears MASTER **before**
+   its save call. Save COMMAND, cacheline/latency, six BAR dwords, interrupt
+   line, and PCIe v2 Device/Link/Device2/Link2 controls. RO/status fields are
+   never replayed. COMMAND/status and PCIe controls use only the low halfword.
+2. Disable function decode (COMMAND=`0x400`, INTx disabled), PMCSR state=3
+   (D3hot), wait 10 ms. PMCSR preserves other controls and writes zero to its
+   PME-status W1C bit.
+3. Write DBI ELBI SYS_CTRL `+0xf24=0x10` (PME_TURNOFF); poll PARF PM_STTS
+   `+0x24` bit5 for up to 100 ms. As downstream, a missing
+   L23_READY is logged and suspension continues; an access fault still aborts.
+   Assert PERST GPIO94 OUT=0; clear PARF LTSSM `+0x1b0` bit8; dwell 1 ms
+   with no PCIe0 access (see above).
+4. Drive WLAN_EN GPIO80 OUT=0; **retain all six rails**, wait 10 ms. Only with
+   `cyclerails`, send enable=0 before that dwell in reverse downstream order:
+   S4G, S6G, S4E, S2G, S5G, L15B. After the dwell, only `cyclerails` sends
+   voltage-before-enable in downstream order: L15B=1800, S5G=1000, S2G=980,
+   S4E=950, S6G=1900, S4G=1350 mV. That is 18 commands (six off, twelve on).
+   Each command is announced before submission and must complete through
+   the existing bounded RSC transport. Resource addresses are checked against
+   the six existing cmd-db results before use.
+5. Originally: GPIO80 OUT=1, wait 10 ms; deassert PERST, wait 1 ms,
+   enable LTSSM (superseded by the M6q enable sequence below), require PARF L0 within 1 s, then DLLLA=1 within 100 ms and
+   PCI ID `17cb:1107`. PMCSR D0,
+   wait 10 ms, enable MEMORY/disable INTx, restore saved BARs/controls and
+   COMMAND with MASTER clear. Revalidate BHIOFF/BHIEOFF and PBL EE.
+6. At the end of step 18, after existing optional pre-BHI work, install an
+   owned, initially fault-only SMMU mapping, perform the existing fabric/ASPM
+   preflight, explicitly restore D0/enable/config, and set COMMAND=`0x406`
+   (MEMORY|MASTER|INTx-disable) before MHI contexts/RX preparation. New owned
+   DMA leaves are published and TLB faults invalidated at step 20.
+
+The Link Status register is DBI `+0x80` (`0x60000080`), bit29 DLLLA. [X PCIe0 resources](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L7-L13)
+map `dm_core` at `0x60000000` separately from the endpoint `conf` window at
+`0x60100000`, and [K DLLLA helper](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L1456-L1480)
+reads it. Our [initial step 11](../shim/fuxi-probe/wlan.c) polls it safely
+before the first LTSSM enable. After a trained link is taken down, however,
+reading it froze the SoC (above), so the cycle reads it only after PARF L0.
+
+The original M6o path was the WLAN_EN/PERST/L23 chronology experiment; `cyclerails` additionally
+cycles the supply votes. It retained the controller clocks, PHY and outbound
+apertures during suspension, without Linux clock/regulator teardown or PHY
+replay. That limitation is the reason for M6q below. M6q retains the votes but
+resets the core/PHY, replays initialization and restores outbound apertures.
+
+The downstream WLAON clear is gated by `qcom,set-wlaon-pwr-ctrl`, absent from
+the matching KIWI child; it is explicitly logged as skipped. See [C gate and
+clear](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1931).
+No QFPROM/fuse programming, secure-world call, or eliminated reset recipe is
+introduced. Existing `pre=qfprom` remains a separate, already eliminated control.
+
+## Host-controller groups
+
+Offsets are relative to PCIe0 PARF or DBI. “Mask” means replace only those
+bits and preserve the remainder; full writes use `0xffffffff`. Shared
+DEVICE_TYPE, PHY_CTRL, PM_CTRL, MHI clock-bypass and AXI halt operations already
+match and stay in the existing sequence. PHY tables, RID/SID routing, ASPM/L1SS
+policy, link target Gen2 and ordinary root/endpoint BAR assignments are not
+new host-write experiments.
+
+| Selector / point | Exact writes | Pinned source |
+| --- | --- | --- |
+| `parf`, step 8 before PHY | PARF `+0x350=0`, `+0=0x365e`, `+0x358=0x04000000`. Suppress the default mainline address-decode block (`+350/+354/+634/+638/+358/+35c` and SYS_CTRL bit29 clear), so it cannot overwrite downstream values. No guessed writes to the other decode registers. | [K initialization](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4705), [X PCIe0 size](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L4) |
+| `dbi`, step 10 before PERST release | PARF `+0x2c4`: clear bit0, set bit8 (mask `0x101`); DBI `+0x714`: set bit5. | [K dynamic width](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4775) |
+| `dbi`, step 11 before LTSSM enable | DBI DEVCTL `+0x78`: MRRS=5, mask `0x7000`, value `0x5000`; write zero to upper W1C status. This is the root request size. | [K link train](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4574) |
+| `dbi`, step 12 after CFG0 enumeration | DBI ACK_F_ASPM_CTRL `+0x70c` set bit15; AUX_CLK_FREQ `+0xb40=20`. No N_FTS/bridge completion-timeout override in X. | [K configuration](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3744) |
+| `eq`, step 11 before MRRS/LTSSM | DBI `+0x80c`: mask `0x1f00`, value `0x100`. For each supported Gen3..Gen4 from root LNKCAP: `+0x890[25:24]=generation-3`; `+0x8a8[23:8]=0`; `+0x890` clear bit0; `+0x8ac[4:0]=0`. Then `+0x8bc` bit0=1, `+0x154=0x55555555`, also `+0x188=0x55555555` if Gen4 supported, and `+0x8bc` bit0=0. Unknown/non-Gen3/4 support aborts. These are DBI equalization shadows, not PHY-table writes. | [K field programming](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3715), [K presets](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3689), [K defaults](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L6770) |
+| `hostirq`, step 8 | PARF INT_ALL_MASK `+0x22c=0`, then `0x3fc0d202`: link-down bit1, L1SUB timeout bit9, bridge flush bit12, AER bits14/15, MSI0..7 bits22..29. No GIC/ITS enable, interrupt handler or AER reporting setup is added. This tests the controller mask separately from endpoint MSI. | [K mask writes](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4713), [K event indices](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L330) |
+
+Optional AER enable/reporting and bridge completion-timeout branches do not
+supply an unconditional KIWI write recipe, and remain out of these groups.
+Already audited routing/window/PM controls remain the established controls.
+
+## `msi`: capability state and MASTER ordering
+
+[C MSI allocation](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L4387)
+requests exactly 32 vectors; [C assignment](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci_qcom.c#L7)
+reserves vectors 0..2 for MHI. [C resume](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1216)
+does link/D0/enable/restore/MASTER before MHI start. MSI address/data are
+IRQ-domain allocations in Linux, **not pinned numeric constants**.
+
+At step 18, save config, locate a valid 64-bit MSI capability with MMC>=5,
+disable inherited MSI/MSI-X, allocate and clean a separate owned DMA page,
+and install its SMMU mapping while BME remains clear. Run fabric preflight,
+D0, function enable/config restore and download ASPM setup, then program:
+
+* MSI address HIGH/LOW to that page's verified IOVA, data base=0 (32-message
+  aligned); if per-vector masking is supported, clear its 32 mask bits.
+* MSI Message Control MME=5 and Enable=1 (dword mask `0x00710000`, value
+  `0x00510000`); preserve MMC, 64-bit support and all other capability fields.
+* COMMAND=`0x406` before contexts/RX preparation. With `cycle`, these steps
+  occur after the probe off/on sequence. With MSI alone there is no rail cycle.
+
+Every message can only overwrite the sink dword, irrespective of vector data;
+no interrupt handler, GIC/ITS programming, MSI-X table or arbitrary destination
+is used. This reproduces the endpoint capability **enable/count** and early
+MASTER ordering, not Linux ITS interrupt delivery or allocator-chosen data.
+An unexpected requester/SID or access outside allocated leaves faults instead
+of accessing unrelated memory. Real hardware delivery/routing is unverified.
+The existing M6 SMMU/RC ownership checks still precede MASTER; early BME never
+exposes bypass DMA. The image/contexts/RX leaves are added, cleaned and TLB
+synchronized at step 20. Step 21 verifies early MASTER and the MSI tuple
+survived and refuses to silently repair a changed state.
+
+## `por`: MHI prepare, RX vector order and POR INTVEC
+
+[K prepare](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/bus/mhi/core/init.c#L1099),
+[K RX programming](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/bus/mhi/core/boot.c#L22), and
+[K POR](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/bus/mhi/core/pm.c#L1122)
+provide these constants/order:
+
+1. Step 20 creates disabled host contexts, then zeros **every** BHIE RX dword
+   `+0x60,+64,+68,+6c,+70,+74,+78`, verifying zero, before RX allocation.
+2. Allocate/zero/clean the existing `0x780000` RDDM sink and its 15-entry
+   16-byte vector table; map them before advertising an RX doorbell.
+3. Write BHIE RX address **HIGH `+0x64`, LOW `+0x60`**, byte size `+0x68=240`,
+   then random nonzero 30-bit sequence at DB `+0x70` (preserve other bits).
+   Every tuple component and sequence is read back. RDDM is a sink only;
+   contents are never dumped.
+4. Write BHI INTVEC `+0x20=0` in POR, then read EE/state. Require PBL. Only
+   SYS_ERR state triggers MHICTRL.RESET, bounded 25-ms reset-clear polling
+   (1 s), then a second INTVEC=0 write and PBL/RESET-state validation. No unconditional cold reset.
+5. Step 21 clears only TX DB/status; it retains the already prepared RX
+   tuple/doorbell and POR INTVEC. Existing BHI STATUS/address/size/random
+   image-doorbell ordering stays intact.
+
+This intentionally separates MHI's HIGH→LOW and early POR order from M6l's
+older late RX staging. It does not attempt to turn RDDM into an image loader.
+
+## `prefix`: allocation and VFS read lifetime
+
+[K firmware/BHI staging](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/bus/mhi/core/boot.c#L476)
+allocates a separate coherent `min(sbl_size,file_size)` buffer from file offset
+zero, frees it after BHI, then allocates FBC. [C sizes](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L5632)
+set the maximum/segment size to `0x80000`.
+
+Step 19 checks the existing file-size/ELF/hash bounds, allocates **only 512 KiB**
+using the existing coherent DMA contract, and reads exactly those prefix bytes
+from the vnode. It retains the full file length as metadata; it does not
+allocate or read the rest of the image. The existing `wl_image` ownership slot
+holds this dedicated prefix allocation, separate from any full-file/FBC buffer.
+Step 20 allocates contexts but **no TX/FBC vector table**. BHI advertises file
+offset zero and `0x80000` bytes, with the existing translation walk, content
+hash, cache publication and readbacks. No ELF segment extraction is introduced.
+
+All experiments stop at 22, so there is no post-BHI full-file allocation.
+The prefix is freed only after normal containment/SMMU undo; on an unproven
+cleanup it is quarantined. That deliberate diagnostic lifetime differs from
+Linux's immediate BHI-prefix free. Small files remain rejected by the existing
+local contract; real inputs in the prior experiment exceed 512 KiB.
+
+## Failure handling and verification
+
+Unexpected writable-bit readback, invalid capability/PCI ID, MMIO error,
+regulator completion failure, bad mapping or bounded wait failure aborts the
+run without retry or panic. Host mutations are journaled before each write;
+reverse undo includes the selected EQ shadow and DBI RO-write gate. W1C status
+is never restored. On abort after early host changes, PERST is contained even
+before MHI becomes available. The original global fault latch is retained.
+MSI is disabled and its saved address/data/mask restored after BME clear and
+before PERST assertion; its sink stays allocated until containment is proven.
+Host undo occurs under asserted PERST. A cycle also announces and drives
+WLAN_EN low. Only `cyclerails` attempts six additional disable votes during
+containment; plain `cycle` leaves all votes intact even on abort. A latched
+access/RSC fault can prevent rail undo for `cyclerails`; that uncertainty is
+logged and buffers remain quarantined. No guessed voltage
+rollback or repeated power-up is attempted. The normal BME-off/PERST/drain and
+owned SMMU undo remain prerequisites for freeing DMA allocations.
+
+[The M6o host suite](../tools/test-fuxi-wlan-m6o.py) compiles production C with
+ASan/UBSan. It checks all 511 nonempty token combinations (including the
+original 255), exact host constants, no cycle/undo rail commands without
+`cyclerails`, all 18 opt-in regulator commands/order/data (plus six on undo),
+retained WLAN_EN/D3/PERST dwells, root-status read faults, pre-access GPIO/RPMh logging, actual config
+loss/restoration during a synthetic cycle, MSI mapping/32 message values, complete RX clears/HIGH→LOW/random DB, POR
+SYS_ERR-only reset, stuck/reset-state failures, prefix bytes/maximum-size file without full allocation,
+invalid selectors/capabilities, failures at new register writes/regulator
+commands/allocations, one-shot BHI/step-22 stop, undo and quarantine. M6i also
+checks the actual runner's invalid-M6o-before-power gate. Both standalone C
+files are checked byte-for-byte against patch 0099. M6o is registered beside
+M6n in the existing `kernel-wlan6g` prebuild list; that list was not invoked.
+
+Host results: M5 compatibility, M6, M6i/M6j, M6k, M6l, M6m, M6n and M6o pass.
+The optional M6 packed-artifact audit needs ignored build outputs that are
+absent here and cannot validate a newly linked kernel. Linux host mocks do
+not establish physical MSI delivery, L23 transitions, effective rail voltage,
+or ROM behavior. A native XNU link requires the macOS/Xcode environment in
+[xnu/README.md](../xnu/README.md). No new hardware result is claimed.
+
+
+## M6q: reset and replay the enable path before retraining
+
+### Supplied device result, kernel `79419be`
+
+With `fuxiwlanseq=cycle,parf,dbi,eq,hostirq,msi,por,prefix`, the DBI freeze fix
+kept the system alive. MASTER clear, function disable, D3hot and PME_TURNOFF
+completed (PME_TURNOFF read back zero). L23_READY was absent and suspension
+continued. PERST went low; LTSSM off wrote `0xd`, read `0x5`. The log printed
+`link down dwell 1 ms, no DBI access` and `PARF LTSSM 0x5 after link down`.
+WLAN_EN went low with all rails retained, then high after 10 ms, followed by
+another 10 ms, PERST high and 1 ms. LTSSM resume wrote/read `0x105`. The PARF
+`0x1c001b0` wait (mask `0x3f`, expected `0x11`, 1000 ms) timed out; the final
+state remained `0x05`. Abort/undo refused PCIe0 accesses as intended, and
+step 17 failed `0x116f` without freezing. Initial steps 9–11 instead train
+Gen2 x2 in about 12 ms, with PARF LTSSM `0x111`. These are the caller's
+observations, not measurements made while implementing M6q.
+
+The inference is that toggling LTSSM on the retained controller is insufficient;
+the result does not identify a particular broken PHY or PARF register.
+[C power-up calls device power-on before PCI resume](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L2633-L2640),
+[C resume restores D0/enable/config before MASTER](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/pci.c#L1216-L1255),
+and [K PM resume calls the full enable routine](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L7994-L8033).
+M6q therefore changes the `cycle` resume, with the selector interface, M6o
+containment, five-second observation and step-22 stop preserved.
+
+### Ordered reset/replay and its sources
+
+PERST stays low and LTSSM stays disabled across WLAN_EN high, core reset,
+PARF programming, PHY reset/table/start/readiness and the EP latency. Plain
+`cycle` keeps all six rail votes; only `cyclerails` sends off/on votes.
+Clocks and GDSCs stay on. This implements the register/reset part of enable,
+not Linux's clock, regulator or interconnect framework teardown.
+
+| Point | Registers and delay | Source / reason |
+| --- | --- | --- |
+| Existing suspend and WLAN_EN | Keep D3hot 10 ms, L23 wait up to 100 ms, link-down 1 ms, WLAN_EN low 10 ms and high 10 ms. The guard closes before attempting PERST low, including partial write failures. | [K PME/L23 suspend](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L7927-L7952) and the M6o chronology above. The two WLAN_EN 10-ms dwells are retained experiment margins, not claimed downstream constants. [C WLAN_EN enable](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/power.c#L919-L949) uses a [1000-us delay](https://github.com/MiCode/vendor_qcom_opensource_wlan/blob/518147fd7e0199758efe9bd96a22c9c2ea30bcd9/platform/cnss2/power.c#L74); it does not prescribe our 10-ms low dwell. |
+| Quiesce PHY | PHY `+0x200=1` asserts PCS SW_RESET; `+0x240=0` powers down before reinit. | [K disable powers down the PHY](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4898-L4922); [X status/power-down offsets](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L133-L139) and [X SW_RESET release/start](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L241-L244). Explicit SW_RESET assertion is our reset preparation; downstream obtains reset through its reset-controller calls. |
+| Reuse step 8 | GCC core BCR `+0x6b000` assert 1 ms, deassert 1 ms; check both readbacks. PARF DEVICE_TYPE `+0x1000=4`, PHY_CTRL `+0x40` bit0 clear, MHI clock `+0x174` bit4 set, PM_CTRL `+0x20` bit5 clear, AXI halt `+0x1a8` bit31 set. Replay step 8's decode and selected `parf`/`hostirq` hooks. Explicitly clear LTSSM `+0x1b0` bit8 again after reset. | [X reset names](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L109-L112), [K BCR offsets](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/clk/qcom/gcc-kalama.c#L3751-L3754), [K reset assertion minimum 1 ms](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3454-L3482), [K enable PARF before PHY](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4694-L4747). The extra 1-ms post-core-reset settle is the existing step-8 margin. Decode/IRQ constants and their citations are in the host-controller table above. |
+| Reuse step 9's PHY helper | GCC PHY BCR `+0x6c01c` assert **1 ms** on resume, deassert, check readbacks, retain 10-us settle. PHY `+0x240` bits1:0=3, replay the existing `wl_phy_tbl`, pipe mux GCC `+0x6b070` bits1:0=0, pipe vote `+0x52008` bit4=1, PHY SW_RESET `+0x200` bit0=0, START `+0x244` bits1:0=3. Stabilize 1 ms; poll PHY `+0x214` bit6 clear for at most 10 ms. | Same reset sources; [K PHY sequence, stabilization, pipe clock, ready wait](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3622-L3684), [K timing constants](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L181-L217), [X PHY sequence boundaries](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L139-L244). Initial step 9 keeps its 250-us BCR hold; resume uses downstream's 1-ms reset minimum. The 10-us post-reset settle and 10-us polling cadence are existing step-9 choices; downstream polls at 1-ms intervals with the same 10-ms ready bound. |
+| PHY ready, PERST still low | Verify core/PHY BCR deasserted, PHY ready, SW_RESET clear, power/start bits=3, PERST low and LTSSM disabled. Open local DBI only. Wait **10 ms after PHY readiness**, then replay `wl_m6o_host(10)` (`dbi` width controls). | [K EP latency and pre-PERST DBI accesses](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4756-L4782), [X ep-latency=10](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L126-L136). The earlier WLAN_EN high dwell does not replace this PHY-ready delay. |
+| Release PERST, train | GPIO94 high, **1 ms** propagation, replay `wl_m6o_host(11)` (`eq`, root MRRS). Close local DBI exception, set PARF LTSSM bit8, wait up to 1 s for PARF `[5:0]=0x11`, then require DBI `+0x80` DLLLA bit29 within 100 ms. | [K release delay then link_train](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4784-L4795), [K default delay](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L6795-L6800), [K EQ/MRRS then LTSSM](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4560-L4596). The 1-s PARF and 100-ms DLLLA bounds remain local diagnostic bounds; no ELBI/DBI polling occurs before L0. |
+| L0/DLLLA, restore apertures | Reuse step 12 (including its conservative 100-ms settle): RC bus numbers `+0x18`, unrolled CFG0 iATU at DBI `+0x1000`, endpoint ID, selected `dbi` N_FTS/AUX hook. Reuse step 14: MEM iATU at `+0x1200`, root memory/prefetch windows `+0x20..2c`, COMMAND low halfword. Then retain M6o endpoint D0/10-ms settle/enable/config restore and BHI/PBL validation. | [K enable reconfigures controller after training](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L4814-L4826), [K force CFG0 reconfiguration and N_FTS/AUX](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L3744-L3776), [K unrolled iATU layout](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/pci/controller/pci-msm.c#L146-L153), [X apertures/ranges](https://github.com/MiCode/kernel_devicetree/blob/5647c799a064dfec73332a4fe2ef7aa3fb2f4887/qcom/kalama-pcie.dtsi#L7-L21). The 100-ms step-12 settle is an existing local margin, not an added downstream delay. No BAR sizing is repeated. |
+
+The PHY table is shared, unchanged, and not relabeled as byte-identical to the
+pinned DT: the existing step-9 mainline table has differences, including
+RXEQEVAL_TIME `+0x6f4` and the pinned DT's trailing overrides. Pipe mux/vote
+writes use the pinned [GCC pipe mux](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/clk/qcom/gcc-kalama.c#L329-L348)
+and [pipe vote register/bit](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/blob/7fad87dc178d09489b74a714e4a525d56f546855/drivers/clk/qcom/gcc-kalama.c#L2153-L2165).
+The default mainline PARF decode remains the existing initial-path choice. `parf` selects the cited downstream decode instead. M6q reuses these
+choices consistently; it does not introduce new PHY tuning or force selectors
+on when the user requested plain `cycle`. The host mutation journal now has
+96 slots to hold the initial writes and their replay, preserving reverse undo
+and EQ bank selection.
+
+### Guard boundary and training diagnostics
+
+`fw_access` and `wl_contain_wr` still enforce the PCIe0 guard. All addresses
+`0x60000000..0x63ffffff` remain refused after suspension until reset/readiness
+is proven. The only temporary exception is **local DBI
+`0x60000000..0x60000f1f` (aligned dwords through `+0xf1c`)**, after both BCR pulses and PHY ready, with PERST
+still asserted and LTSSM disabled. It permits the selected width/EQ/MRRS
+programming, including the downstream writes after PERST release but before
+LTSSM enable. It excludes ELBI at `+0xf20`, iATU, endpoint config and BAR
+windows, matching X's separate dm_core/ELBI resources above. The exception
+closes before LTSSM enable and on every resume exit. PARF L0 then opens the
+apertures for DLLLA and restoration; DLLLA failure recloses them for abort.
+
+This is an explicit hardware hypothesis, not a claim that fault containment
+can recover a hung NoC: the observed freeze followed removal of a **trained**
+link without core/PHY reset. Initial pre-training DBI accesses after reset
+were safe on device, and downstream performs DBI accesses after PHY ready
+before training. M6q recreates that boundary rather than allowing DBI merely
+because WLAN_EN rose or a timer elapsed. A failed reset/ready check never
+opens it. Hardware still needs to establish whether this reinitialization
+actually retrains the link.
+
+The PARF L0 loop samples every 1 ms and records two 32-bit seen masks, with
+states 0..31 in the first and 32..63 in the second (the initial step-11
+representation). Both success and failure print elapsed time, last LTSSM,
+`seen low/high`, PARF PM_STTS `+0x24` and PHY_STATUS `+0x214`. For example, a
+constant state 5 gives `seen 0x20/0`; L0 sets bit17. Short states between
+samples can be missed; these masks record observations, not transition order.
+No DBI/ELBI diagnostic read is needed on timeout. PHY-init completion/failure
+also prints ready time and PHY status before the guard boundary.
+
+### Host verification
+
+M6o compiles the actual shared step-8, PHY helper, step-12 and step-14 code.
+Its independent MMIO model permits pre-training local DBI only after actual modeled core/PHY resets and readiness;
+remote apertures require L0. Reset destroys modeled RC windows so their
+restoration is substantive. Coverage includes all 511 combinations, full PHY
+table replay, reset/PHY write faults, dropped BCR writes, stuck PHY, training
+read faults, L0 timeout, DLLLA timeout, seen masks spanning both words, guard reclosure and the existing rail/MSI/POR/
+prefix/undo tests. Other M6 suites use aborting stubs for the shared routines:
+unexpected entry into cycle fails rather than silently succeeding.
+
+All `tools/test-fuxi-wlan-m6*.py` host suites pass, except the packed-artifact
+audit which requires ignored linked-kernel/packing outputs unavailable in this
+worktree. M5 compatibility also passes. Patch 0099's two added C files are
+byte-identical to their standalone sources, with matching new-file hunk line
+counts. No phone, remote build, workflow, push, firmware or blobs were used.
